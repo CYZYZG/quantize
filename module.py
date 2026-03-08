@@ -1,0 +1,247 @@
+import math
+import numpy as np
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.autograd import Variable
+
+
+def calcScaleZeroPoint(min_val, max_val, num_bits=8):
+    qmin = 0.
+    qmax = 2. ** num_bits - 1.
+    scale = (max_val - min_val) / (qmax - qmin)
+
+    zero_point = qmax - max_val / scale
+
+    if zero_point < qmin:
+        zero_point = torch.tensor([qmin], dtype=torch.float32).to(min_val.device)
+    elif zero_point > qmax:
+        # zero_point = qmax
+        zero_point = torch.tensor([qmax], dtype=torch.float32).to(max_val.device)
+    
+    zero_point.round_()
+
+    return scale, zero_point
+
+def quantize_tensor(x, scale, zero_point, num_bits=8, signed=False):
+    if signed:
+        qmin = - 2. ** (num_bits - 1)
+        qmax = 2. ** (num_bits - 1) - 1
+    else:
+        qmin = 0.
+        qmax = 2. ** num_bits - 1.
+ 
+    q_x = zero_point + x / scale
+    q_x.clamp_(qmin, qmax).round_()
+    
+    return q_x
+ 
+def dequantize_tensor(q_x, scale, zero_point):
+    return scale * (q_x - zero_point)
+
+class QParam(nn.Module):
+
+    def __init__(self, num_bits=8):
+        super(QParam, self).__init__()
+        self.num_bits = num_bits
+        self.scale = None
+        self.zero_point = None
+        self.min = None
+        self.max = None
+
+    def update(self, tensor):
+        if self.max is None or self.max < tensor.max():
+            self.max = tensor.max()
+        
+        if self.min is None or self.min > tensor.min():
+            self.min = tensor.min()
+        
+        self.scale, self.zero_point = calcScaleZeroPoint(self.min, self.max, self.num_bits)
+    
+    def quantize_tensor(self, tensor):
+        return quantize_tensor(tensor, self.scale, self.zero_point, num_bits=self.num_bits)
+
+    def dequantize_tensor(self, q_x):
+        return dequantize_tensor(q_x, self.scale, self.zero_point)
+
+class QModule(nn.Module):
+
+    def __init__(self, qi=True, qo=True, num_bits=8):
+        super(QModule, self).__init__()
+        if qi:
+            self.qi = QParam(num_bits=num_bits)
+        if qo:
+            self.qo = QParam(num_bits=num_bits)
+
+    def freeze(self):
+        pass
+
+    def quantize_inference(self, x):
+        raise NotImplementedError('quantize_inference should be implemented.')
+
+
+class QConv2d(QModule):
+
+    def __init__(self, conv_module, qi=True, qo=True, num_bits=8):
+        super(QConv2d, self).__init__(qi=qi, qo=qo, num_bits=num_bits)
+        self.num_bits = num_bits
+        self.conv_module = conv_module
+        self.qw = QParam(num_bits=num_bits)
+
+    def freeze(self, qi=None, qo=None):
+        
+        if hasattr(self, 'qi') and qi is not None:
+            raise ValueError('qi has been provided in init function.')
+        if not hasattr(self, 'qi') and qi is None:
+            raise ValueError('qi is not existed, should be provided.')
+
+        if hasattr(self, 'qo') and qo is not None:
+            raise ValueError('qo has been provided in init function.')
+        if not hasattr(self, 'qo') and qo is None:
+            raise ValueError('qo is not existed, should be provided.')
+
+        if qi is not None:
+            self.qi = qi
+        if qo is not None:
+            self.qo = qo
+        self.M = self.qw.scale * self.qi.scale / self.qo.scale
+
+        self.conv_module.weight.data = self.qw.quantize_tensor(self.conv_module.weight.data)
+        self.conv_module.weight.data = self.conv_module.weight.data - self.qw.zero_point
+
+        self.conv_module.bias.data = quantize_tensor(self.conv_module.bias.data, scale=self.qi.scale * self.qw.scale,
+                                                     zero_point=0, signed=True)
+
+    def forward(self, x):
+        if hasattr(self, 'qi'):
+            self.qi.update(x)
+
+        self.qw.update(self.conv_module.weight.data)
+
+        self.conv_module.weight.data = self.qw.quantize_tensor(self.conv_module.weight.data)
+        self.conv_module.weight.data = self.qw.dequantize_tensor(self.conv_module.weight.data)
+ 
+        x = self.conv_module(x)
+
+        if hasattr(self, 'qo'):
+            self.qo.update(x)
+
+        return x
+
+    def quantize_inference(self, x):
+        x = x - self.qi.zero_point
+        x = self.conv_module(x)
+        x = self.M * x + self.qo.zero_point
+        return x
+
+
+class QLinear(QModule):
+
+    def __init__(self, fc_module, qi=True, qo=True, num_bits=8):
+        super(QLinear, self).__init__(qi=qi, qo=qo, num_bits=num_bits)
+        self.num_bits = num_bits
+        self.fc_module = fc_module
+        self.qw = QParam(num_bits=num_bits)
+
+    def freeze(self, qi=None, qo=None):
+
+        if hasattr(self, 'qi') and qi is not None:
+            raise ValueError('qi has been provided in init function.')
+        if not hasattr(self, 'qi') and qi is None:
+            raise ValueError('qi is not existed, should be provided.')
+
+        if hasattr(self, 'qo') and qo is not None:
+            raise ValueError('qo has been provided in init function.')
+        if not hasattr(self, 'qo') and qo is None:
+            raise ValueError('qo is not existed, should be provided.')
+
+        if qi is not None:
+            self.qi = qi
+        if qo is not None:
+            self.qo = qo
+        self.M = self.qw.scale * self.qi.scale / self.qo.scale
+
+        self.fc_module.weight.data = self.qw.quantize_tensor(self.fc_module.weight.data)
+        self.fc_module.weight.data = self.fc_module.weight.data - self.qw.zero_point
+        self.fc_module.bias.data = quantize_tensor(self.fc_module.bias.data, scale=self.qi.scale * self.qw.scale,
+                                                   zero_point=0, signed=True)
+
+    def forward(self, x):
+        if hasattr(self, 'qi'):
+            self.qi.update(x)
+
+        self.qw.update(self.fc_module.weight.data)
+
+        self.fc_module.weight.data = self.qw.quantize_tensor(self.fc_module.weight.data)
+        self.fc_module.weight.data = self.qw.dequantize_tensor(self.fc_module.weight.data)
+        
+        x = self.fc_module(x)
+
+        if hasattr(self, 'qo'):
+            self.qo.update(x)
+
+        return x
+
+    def quantize_inference(self, x):
+        x = x - self.qi.zero_point
+        x = self.fc_module(x)
+        x = self.M * x
+        x = x + self.qo.zero_point
+        return x
+
+
+class QReLU(QModule):
+
+    def __init__(self, qi=False, num_bits=None):
+        super(QReLU, self).__init__(qi=qi, num_bits=num_bits)
+
+    def freeze(self, qi=None):
+        
+        if hasattr(self, 'qi') and qi is not None:
+            raise ValueError('qi has been provided in init function.')
+        if not hasattr(self, 'qi') and qi is None:
+            raise ValueError('qi is not existed, should be provided.')
+
+        if qi is not None:
+            self.qi = qi
+
+    def forward(self, x):
+        if hasattr(self, 'qi'):
+            self.qi.update(x)
+
+        x = F.relu(x)
+
+        return x
+    
+    def quantize_inference(self, x):
+        x = x.clone()
+        x[x < self.qi.zero_point] = self.qi.zero_point
+        return x
+
+class QMaxPooling2d(QModule):
+
+    def __init__(self, kernel_size=3, stride=1, padding=0, qi=False, num_bits=None):
+        super(QMaxPooling2d, self).__init__(qi=qi, num_bits=num_bits)
+        self.kernel_size = kernel_size
+        self.stride = stride
+        self.padding = padding
+
+    def freeze(self, qi=None):
+        if hasattr(self, 'qi') and qi is not None:
+            raise ValueError('qi has been provided in init function.')
+        if not hasattr(self, 'qi') and qi is None:
+            raise ValueError('qi is not existed, should be provided.')
+        if qi is not None:
+            self.qi = qi
+
+    def forward(self, x):
+        if hasattr(self, 'qi'):
+            self.qi.update(x)
+
+        x = F.max_pool2d(x, self.kernel_size, self.stride, self.padding)
+
+        return x
+
+    def quantize_inference(self, x):
+        return F.max_pool2d(x, self.kernel_size, self.stride, self.padding)
